@@ -332,21 +332,28 @@ fn read_ipv4_from_stdin() -> Option<Ipv4> {
     let mut len = 0usize;
 
     loop {
-        if len >= 15 {
-            break;
-        }
         let mut byte = [0u8; 1];
         if stdin().read_exact(&mut byte).is_err() {
             break;
         }
+
+        // Skip leftover leading newlines from previous prompts;
+        // break only when newline is encountered AFTER reading IP characters.
         if byte[0] == b'\n' || byte[0] == b'\r' {
-            break;
+            if len == 0 {
+                continue;
+            } else {
+                break;
+            }
         }
-        buf[len] = byte[0];
-        len = match len.checked_add(1) {
-            Some(v) => v,
-            None => break,
-        };
+
+        if len < 15 {
+            buf[len] = byte[0];
+            len = match len.checked_add(1) {
+                Some(v) => v,
+                None => break,
+            };
+        }
     }
 
     let input = match std::str::from_utf8(&buf[..len]) {
@@ -384,21 +391,26 @@ fn prompt_mode() -> AppMode {
     let mut len = 0usize;
 
     loop {
-        if len >= 4 {
-            break;
-        }
         let mut byte = [0u8; 1];
         if stdin().read_exact(&mut byte).is_err() {
             break;
         }
+
         if byte[0] == b'\n' || byte[0] == b'\r' {
-            break;
+            if len == 0 {
+                continue;
+            } else {
+                break;
+            }
         }
-        buf[len] = byte[0];
-        len = match len.checked_add(1) {
-            Some(v) => v,
-            None => break,
-        };
+
+        if len < 4 {
+            buf[len] = byte[0];
+            len = match len.checked_add(1) {
+                Some(v) => v,
+                None => break,
+            };
+        }
     }
 
     if len > 0 && buf[0] == b'2' {
