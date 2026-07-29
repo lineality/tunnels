@@ -309,7 +309,7 @@ Because UDP packets can be dropped, duplicated, or arrive out of order, 'cryptog
 
 1. Packet Structure (e.g., 64 bytes total):
 Bytes 0 to 3: 4-byte random noise nonce (how to generate...?)
-Bytes 4 to 7: 4-byte POSIX Timestamp (for replay protection & order-sync)
+Bytes 4 to 7: 4-byte unsigned POSIX Timestamp (for replay protection & order-sync)
 Bytes 8 to 61: fixed-block 54 byte ASCII Payload (encoded)
 Byte 63: Validation-byte / Checksum-byte 2: known value to check
 Byte 63: Validation-byte / Checksum-byte 1: pearson hash of first 63 bytes (Q: which table state?)
@@ -317,129 +317,65 @@ Byte 63: Validation-byte / Checksum-byte 1: pearson hash of first 63 bytes (Q: w
 
 
 
-v4: Two Table Pearson Pingpong Encoding:
-- Remote-Collaborator Salt Array / "Secrete-Key"
-- Novel system-entropy based Nonce
-- per-block combination of secrete-key-array and Nonce
-- Two Tables
-- Table 1 initialized with:
-initial_seed_key = secret-key-array + nonce
-Initialize a 256-byte state table 'S1' using Fisher-Yates shuffle seeded by initial_seed_key
+v5: Two Table Pearson Pingpong Encoding:
 
-only one secrete-key-array needed:
+====================================================================
+PINGPONG TWO-TABLE LOOP SPECIFICATION (54 Bytes, Position i = 0..53)
+====================================================================
+At a very high level this is like having a sender and receiver
+use an inverted Pearson-table to encode/decode each byte
+(which each byte is one ASCII character): look up the byte
+in the table, quick-lookup, done. Simple, cheap, quick, clean.
 
-seed_1 = secret-key-array + nonce
-seed_2 = secret-key-array + nonce + bitwise NOT !seed_1
+This two-table system uses a few added mechanisms:
+- two tables, with feedback between the tables
+- salts (selected by a user)
+- a nonce to begin the message
+- a position-counter to give a novel-offset to the table
+- mutation of the table through the process
+- using the last-byte as additional feedback
 
-- posix: system entropy (/dev/urandom or OS time + CPU counters)
-
-- selection of which two indices i & j to swap is calculated using running pointers.
-Pointer i moves sequentially so every table position gets mutated.
-Pointer j accumulates state and feedback from the data
-
-
-
-
-
-Two-Table Ping-Pong Encoding and Table-Mutation:
-
-1.  Two Tables (T_1 and T_2): Both 256-byte tables are pre-scrambled at packet
-    start using the secret-key-array + nonce.
-2.  Double Lookup: To encrypt a byte M:
-      - Step A: Pass input through T_1 to get an intermediate byte X:
-        X = T_1[\text{state} \oplus M]
-      - Step B: Pass intermediate byte X through T_2 to get the ciphertext byte
-        C: C = T_2[X]
-3.  Cross-Mutation Feedback:
-MVP-1 target is 2-swaps per byte, e.g. for a normal-short text of 55-bytes, 110/265 values are shuffled (applies to both tables).
-
-      - The value X from Table 1 selects which elements to swap in Table 2.
-      - The value C from Table 2 selects which elements to swap in Table 1.
-Table 2 selects which elements to swap in Table 1.
+This turns the pearson-table into a streaming-cipher, while
+still being computation cheap and relatively easy to maintain
+and implement.
 
 
-Encode-Decode Flip:
+Local Variables:
+  - prev_cipher_byte: u8 (Initialized to 0 before byte 0)
+  - position_counter: usize             (Payload position counter, 0 to 53)
 
 
-...
+Sender: Encoding Loop (Per Plaintext Byte 'm'):
 
-Sender uses T_1 and T_2 to encrypt, and the Receiver uses inverse tables T_1^{-1} and T_2^{-1} to decrypt.
+1. Calculate Table 1 Read Index:
+   lookup_index_1 = (prev_cipher_byte ^ m ^ (position_counter as u8)) as usize
 
-...
+2. Double Lookup: (Table-2 lookup is simple)
+   x = T1[lookup_index_1]
+   c = T2[x as usize]     --> 'c' is the ciphertext byte written to packet[8 + position_counter]
 
+3. Update Ciphertext Feedback:
+   prev_cipher_byte = c   --> Saves 'c' to use in step 1 of the NEXT byte
 
-Mechanics: Sender vs. Receiver
-
-Because T_1 and T_2 are lookup permutations, the Sender uses T_1 and T_2 to
-encrypt, while the Receiver uses inverse tables T_1^{-1} and T_2^{-1} to
-decrypt.
-
-1. Packet Pre-Scrambling Phase (Both Sender and Receiver)
-
-1.  Read/Write 4-byte nonce at Bytes 0..3 of the 64-byte packet.
-2.  Generate seed_1 and seed_2.
-3.  Pre-scramble T_1 (256 swaps using seed_1).
-4.  Pre-scramble T_2 (256 swaps using seed_2).
-5.  Build inverse tables T_1^{-1} and T_2^{-1} (takes 256 assignments:
-    T_inv[T[i]] = i).
-
-2. Sender Encoding Loop (Per ASCII Byte M)
-
-For each plaintext byte M:
-
-1.  Step A (Table 1 Lookup): X = T_1[{state} + M]
-2.  Step B (Table 2 Lookup):
-    C = T_2[X] \quad {(This is the ciphertext byte sent on the wire)}
-3.  Step C (State Update): {state} = M
-4.  Step D (Cross-Mutation Swaps):
-      - Use X to perform 2 swaps in T_2.
-      - Use C to perform 2 swaps in T_1.
-
-3. Receiver Decoding Loop (Per Ciphertext Byte C)
-
-When receiver reads C from the wire:
-
-1.  Step A (Table 2 Inverse Lookup): X = T_2^{-1}[C]
-2.  Step B (Table 1 Inverse Lookup): {Raw} = T_1^{-1}[X]
-    M = {state} + {Raw} \quad {(Original ASCII byte recovered!)}
-3.  Step C (State Update): {state} = M
-4.  Step D (Cross-Mutation Swaps):
-      - Use X to perform the same 2 swaps in T_2 (and update T_2^{-1}).
-      - Use C to perform the same 2 swaps in T_1 (and update T_1^{-1}).
+4. Dynamic Table Swaps (2 Swaps in T2, 2 Swaps in T1):
+   salt_val = (salts[position_counter & 15] & 0xFF) as u8
+   - Mutate T2 using byte 'x' and 'salt_val'
+   - Mutate T1 using byte 'c' and 'salt_val'
 
 
-## design requirements:
+Receiver: Decoding Loop (Per Ciphertext Byte 'c' from packet[8 + position_counter]):
 
-1.  Zero Heap Allocation: Fixed 256-byte stack arrays ([u8; 256]) for
-    T_1, T_2, T_1^{-1}, T_2^{-1}.
+1. Double Inverse Lookup:
+   x = T2_inv[c as usize]
+   raw = T1_inv[x as usize]
 
-2.  Independed Packets are Resilient to Packet Loss:
-    Every 64-byte UDP packet re-seeds T_1 and T_2 from
-    its own nonce. If Packet #3 is lost, Packet #4 still decrypts cleanly.
+2. Recover Plaintext Byte 'm':
+   m = prev_cipher_byte ^ raw ^ (position_counter as u8)  --> 'm' is the original ASCII character
 
-3.  High Diffusion: Double-stage non-linear mapping (T_1 -> T_2) makes
-    known-plaintext attack equation-solving impossible even on
-    short 10-character messages.
+3. Update previous Ciphertext byte (a feedback mechanism):
+   prev_cipher_byte = c   --> Saves 'c' to match sender state for the NEXT byte
 
-
-
-Kerckhoffs's Principle or Shannon's Maxim: "The enemy knows the system"
-
-  - code is public
-  - 4-byte nonce is sent in cleartext at Bytes 0..3 of each packet
-  - secret that keeps the system secure is the secret-key-array
-
-Making the key array larger directly increases the brute-force search
-space
-
-
-| Key Array Size                   | Bit Security | Search Space ($2^N$)                      | Quantum Resistance (Grover's)   |
-| :------------------------------- | :----------- | :---------------------------------------- | :------------------------------ |
-| **4 $\times$ `u32` (16 bytes)**  | 128-bit      | $2^{128} \approx 3.4 \times 10^{38}$      | 64-bit (Weak against quantum)   |
-| **8 $\times$ `u32` (32 bytes)**  | **256-bit**  | **$2^{256} \approx 1.15 \times 10^{77}$** | **128-bit (Post-Quantum Safe)** |
-| **16 $\times$ `u32` (64 bytes)** | 512-bit      | $2^{512} \approx 1.34 \times 10^{154}$    | 256-bit (Overkill)              |
-
-
-mvp1 may use 8 bytes, but the system should be flexible to increase that to N size array as users choose
-
-16 might be a better default / Nudge - the "tyranny of the default" where "temporary things end up becoming permanent".
+4. Dynamic Table Swaps (Identical to Sender):
+   salt_val = (salts[position_counter & 15] & 0xFF) as u8
+   - Mutate T2 (and T2_inv) using byte 'x' and 'salt_val'
+   - Mutate T1 (and T1_inv) using byte 'c' and 'salt_val'

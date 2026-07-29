@@ -181,7 +181,7 @@ impl Port {
 struct Ipv4(Ipv4Addr);
 
 impl Ipv4 {
-    pub const fn from_octets(a: u8, b: u8, c: u8, d: u8) -> Self {
+    pub const fn _from_octets(a: u8, b: u8, c: u8, d: u8) -> Self {
         Self(Ipv4Addr::new(a, b, c, d))
     }
 
@@ -806,25 +806,35 @@ impl PingPongEngine {
         inv[val_i as usize] = j as u8;
     }
 
+    // Dynamic table mutation using salt from array, not fixed values e.g. 13, 7, 3, 101
     #[inline]
-    fn mutate_t2(&mut self, x: u8) {
+    fn mutate_t2(&mut self, x: u8, salt_val: u8) {
         let i1 = x as usize;
-        let j1 = (i1.wrapping_add(13)) & 0xFF;
+        // Make offset odd (| 1) so it is coprime with 256 (reaches all positions)
+        let offset = (salt_val | 1) as usize;
+
+        // Swap 1: Uses dynamic salt offset instead of static +13
+        let j1 = i1.wrapping_add(offset) & 0xFF;
         Self::swap_and_update(&mut self.t2, &mut self.inv2, i1, j1);
 
-        let i2 = (i1.wrapping_mul(7).wrapping_add(3)) & 0xFF;
-        let j2 = (i2.wrapping_add(101)) & 0xFF;
+        // Swap 2: Uses dynamic salt offset instead of static +3 and +101
+        let i2 = (i1.wrapping_mul(5).wrapping_add(offset)) & 0xFF;
+        let j2 = i2.wrapping_add(offset) & 0xFF;
         Self::swap_and_update(&mut self.t2, &mut self.inv2, i2, j2);
     }
 
     #[inline]
-    fn mutate_t1(&mut self, c: u8) {
+    fn mutate_t1(&mut self, c: u8, salt_val: u8) {
         let i1 = c as usize;
-        let j1 = (i1.wrapping_add(17)) & 0xFF;
+        let offset = (salt_val | 1) as usize;
+
+        // Swap 1: Uses dynamic salt offset instead of static +17
+        let j1 = i1.wrapping_add(offset) & 0xFF;
         Self::swap_and_update(&mut self.t1, &mut self.inv1, i1, j1);
 
-        let i2 = (i1.wrapping_mul(11).wrapping_add(5)) & 0xFF;
-        let j2 = (i2.wrapping_add(67)) & 0xFF;
+        // Swap 2: Uses dynamic salt offset instead of static +5 and +67
+        let i2 = (i1.wrapping_mul(3).wrapping_add(offset)) & 0xFF;
+        let j2 = i2.wrapping_add(offset) & 0xFF;
         Self::swap_and_update(&mut self.t1, &mut self.inv1, i2, j2);
     }
 
@@ -860,6 +870,7 @@ impl PingPongEngine {
 
     pub fn encrypt_payload(
         &mut self,
+        salts: &[u32; 16],
         plaintext: &[u8; PAYLOAD_SIZE],
         ciphertext: &mut [u8; PAYLOAD_SIZE],
     ) {
@@ -867,14 +878,21 @@ impl PingPongEngine {
         let mut i = 0usize;
         while i < PAYLOAD_SIZE {
             let m = plaintext[i];
-            let idx1 = (state ^ m) as usize;
+
+            // --- Inject position counter 'i' into lookup ---
+            let idx1 = (state ^ m ^ (i as u8)) as usize;
             let x = self.t1[idx1];
             let c = self.t2[x as usize];
             ciphertext[i] = c;
-            state = m;
 
-            self.mutate_t2(x);
-            self.mutate_t1(c);
+            // --- Set next state to ciphertext 'c' (prevents plaintext lock) ---
+            state = c;
+
+            // --- Fetch salt byte using counter 'i & 15' (0-15 wrapping index) ---
+            let salt_val = (salts[i & 15] & 0xFF) as u8;
+
+            self.mutate_t2(x, salt_val);
+            self.mutate_t1(c, salt_val);
 
             i = match i.checked_add(1) {
                 Some(v) => v,
@@ -885,6 +903,7 @@ impl PingPongEngine {
 
     pub fn decrypt_payload(
         &mut self,
+        salts: &[u32; 16], // <--- Added salts array reference
         ciphertext: &[u8; PAYLOAD_SIZE],
         plaintext: &mut [u8; PAYLOAD_SIZE],
     ) {
@@ -894,12 +913,19 @@ impl PingPongEngine {
             let c = ciphertext[i];
             let x = self.inv2[c as usize];
             let raw = self.inv1[x as usize];
-            let m = state ^ raw;
-            plaintext[i] = m;
-            state = m;
 
-            self.mutate_t2(x);
-            self.mutate_t1(c);
+            // --- CHANGE 1: Invert position counter 'i' to recover original plaintext M ---
+            let m = state ^ raw ^ (i as u8);
+            plaintext[i] = m;
+
+            // --- CHANGE 1: Set next state to ciphertext 'c' (matches encoder) ---
+            state = c;
+
+            // --- CHANGE 2: Fetch salt byte using counter 'i & 15' ---
+            let salt_val = (salts[i & 15] & 0xFF) as u8;
+
+            self.mutate_t2(x, salt_val);
+            self.mutate_t1(c, salt_val);
 
             i = match i.checked_add(1) {
                 Some(v) => v,
@@ -971,7 +997,7 @@ fn construct_packet(
     out_packet[62] = engine.encrypt_byte62(checksum);
 
     let mut cipher_payload = [0u8; PAYLOAD_SIZE];
-    engine.encrypt_payload(payload, &mut cipher_payload);
+    engine.encrypt_payload(&keys.salts, payload, &mut cipher_payload);
 
     let mut i = 0usize;
     while i < PAYLOAD_SIZE {
@@ -1000,7 +1026,10 @@ fn process_incoming_packet(
     let ts = !u32::from_be_bytes(ts_bytes);
 
     let now = current_timestamp();
-    let diff = if now > ts { now - ts } else { ts - now };
+
+    // to keep packet-ordering safe after 2106
+    let diff = now.abs_diff(ts); // prevents potential subtraction overflow
+
     if diff > 30 {
         return Err(TunnelError::UdpTimestampStale);
     }
@@ -1045,7 +1074,7 @@ fn process_incoming_packet(
         };
     }
 
-    engine.decrypt_payload(&cipher_payload, out_payload);
+    engine.decrypt_payload(&active_keys.salts, &cipher_payload, out_payload);
 
     let computed_checksum = engine.compute_pearson_checksum(out_payload);
     if computed_checksum != decrypted_62 {
@@ -1501,7 +1530,7 @@ mod tests {
         };
         let peer_target = PeerTarget {
             endpoint: Endpoint {
-                ip: Ipv4::from_octets(127, 0, 0, 1),
+                ip: Ipv4::_from_octets(127, 0, 0, 1),
                 port: Port(8080),
             },
             keys,
@@ -1534,5 +1563,163 @@ mod tests {
 
         assert_eq!(valid_len, msg.len());
         assert_eq!(&decrypted_payload[..valid_len], msg);
+    }
+}
+
+#[cfg(test)]
+mod entropy_tests {
+    use super::*;
+
+    /// Calculates Shannon Entropy on a byte slice.
+    /// Returns bits per byte (0.0 to 8.0).
+    fn calculate_shannon_entropy(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        let mut byte_counts = [0usize; 256];
+        for &b in data {
+            byte_counts[b as usize] += 1;
+        }
+        let len_f = data.len() as f64;
+        let mut entropy = 0.0f64;
+        for &count in &byte_counts {
+            if count > 0 {
+                let p = count as f64 / len_f;
+                entropy -= p * p.log2();
+            }
+        }
+        entropy
+    }
+
+    /// Finds the maximum length of repeated adjacent bytes (e.g. [0xAA, 0xAA, 0xAA] -> 3).
+    fn max_consecutive_run(data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let mut max_run = 1usize;
+        let mut current_run = 1usize;
+        let mut i = 1usize;
+        while i < data.len() {
+            if data[i] == data[i - 1] {
+                current_run += 1;
+                if current_run > max_run {
+                    max_run = current_run;
+                }
+            } else {
+                current_run = 1;
+            }
+            i += 1;
+        }
+        max_run
+    }
+
+    #[test]
+    fn test_entropy_repeated_character_a() {
+        let keys = ConfigKeys {
+            salts: DEFAULT_SALTS,
+            val_byte: DEFAULT_VAL_BYTE,
+        };
+        let payload = [b'a'; PAYLOAD_SIZE];
+        let mut packet = [0u8; PACKET_SIZE];
+
+        construct_packet(&keys, &payload, &mut packet);
+
+        let cipher_payload = &packet[8..62];
+        let entropy = calculate_shannon_entropy(cipher_payload);
+        let longest_run = max_consecutive_run(cipher_payload);
+
+        println!("Entropy for 'a'*54: {:.4}", entropy);
+        println!("Longest run for 'a'*54: {}", longest_run);
+
+        // Enforce high entropy: Must be > 4.5 bits/byte for 54 bytes
+        assert!(
+            entropy > 4.5,
+            "Entropy too low ({:.4}) for repeated input 'a'*54",
+            entropy
+        );
+
+        // Enforce run-length limit: No more than 3 identical adjacent ciphertext bytes
+        assert!(
+            longest_run <= 3,
+            "Ciphertext contains unacceptable repeating run length of {}",
+            longest_run
+        );
+    }
+
+    #[test]
+    fn test_entropy_repeated_pattern_hi() {
+        let keys = ConfigKeys {
+            salts: DEFAULT_SALTS,
+            val_byte: DEFAULT_VAL_BYTE,
+        };
+        let mut payload = [0u8; PAYLOAD_SIZE];
+        let pattern = b"Hi";
+        let mut i = 0usize;
+        while i < PAYLOAD_SIZE {
+            payload[i] = pattern[i % pattern.len()];
+            i += 1;
+        }
+
+        let mut packet = [0u8; PACKET_SIZE];
+        construct_packet(&keys, &payload, &mut packet);
+
+        let cipher_payload = &packet[8..62];
+        let entropy = calculate_shannon_entropy(cipher_payload);
+        let longest_run = max_consecutive_run(cipher_payload);
+
+        println!("Entropy for 'Hi'*27: {:.4}", entropy);
+        println!("Longest run for 'Hi'*27: {}", longest_run);
+
+        assert!(
+            entropy > 4.5,
+            "Entropy too low ({:.4}) for repeated input 'Hi'*27",
+            entropy
+        );
+        assert!(
+            longest_run <= 3,
+            "Ciphertext contains unacceptable repeating run length of {}",
+            longest_run
+        );
+    }
+    #[test]
+    fn test_avalanche_effect_single_bit_flip() {
+        let keys = ConfigKeys {
+            salts: DEFAULT_SALTS,
+            val_byte: DEFAULT_VAL_BYTE,
+        };
+        let payload1 = [b'a'; PAYLOAD_SIZE];
+        let mut payload2 = [b'a'; PAYLOAD_SIZE];
+        payload2[0] = b'b'; // Single byte change
+
+        let nonce = 0xDEADBEEF;
+        let mut engine1 = PingPongEngine::init(&keys.salts, nonce);
+        let mut engine2 = PingPongEngine::init(&keys.salts, nonce);
+
+        let mut cipher1 = [0u8; PAYLOAD_SIZE];
+        let mut cipher2 = [0u8; PAYLOAD_SIZE];
+
+        // --- UPDATED: Added &keys.salts as the first payload parameter ---
+        engine1.encrypt_payload(&keys.salts, &payload1, &mut cipher1);
+        engine2.encrypt_payload(&keys.salts, &payload2, &mut cipher2);
+
+        // Count bit differences (Hamming Distance)
+        let mut bit_diffs = 0u32;
+        let mut i = 0usize;
+        while i < PAYLOAD_SIZE {
+            bit_diffs += (cipher1[i] ^ cipher2[i]).count_ones();
+            i += 1;
+        }
+
+        let total_bits = (PAYLOAD_SIZE * 8) as f32;
+        let diff_ratio = bit_diffs as f32 / total_bits;
+
+        println!("Hamming Bit Difference Ratio: {:.2}%", diff_ratio * 100.0);
+
+        // Ideal Avalanche Effect for strong ciphers is ~50% bit flip ratio
+        assert!(
+            diff_ratio > 0.35,
+            "Avalanche effect too weak ({:.2}%) for single byte change",
+            diff_ratio * 100.0
+        );
     }
 }
