@@ -1,5 +1,5 @@
 [package]
-name = "ascii_tunnel"
+name = "tcp_ascii_tunnel"
 version = "0.1.0"
 edition = "2024"
 
