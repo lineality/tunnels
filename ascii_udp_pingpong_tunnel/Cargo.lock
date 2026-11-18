@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "ascii_pingpong_tunnel"
+name = "ascii_udp_pingpong_tunnel"
 version = "0.1.0"
